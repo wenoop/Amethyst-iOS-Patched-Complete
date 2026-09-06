@@ -1,0 +1,279 @@
+name: Sync upstream from point and patch
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: 'Specific upstream commit SHA to sync from (leave empty = latest main)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Backup local workflows
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/workflows-backup
+          if [ -d .github/workflows ]; then
+            cp -a .github/workflows /tmp/workflows-backup/
+          fi
+
+      - name: Add upstream remote
+        run: |
+          git remote get-url upstream >/dev/null 2>&1 || \
+            git remote add upstream https://github.com/AngelAuraMC/Amethyst-iOS.git
+          git fetch upstream main --prune
+          # fetch full history so any pinned SHA is resolvable
+          git fetch upstream --unshallow 2>/dev/null || true
+
+      - name: Reset to upstream ref
+        run: |
+          UPSTREAM_REF="${{ github.event.inputs.upstream_ref }}"
+          if [ -n "$UPSTREAM_REF" ]; then
+            echo "Pinning to: $UPSTREAM_REF"
+            git checkout -B main "$UPSTREAM_REF"
+            git reset --hard "$UPSTREAM_REF"
+          else
+            git checkout -B main upstream/main
+            git reset --hard upstream/main
+          fi
+
+      - name: Restore fork-only workflow files
+        run: |
+          set -euo pipefail
+          if [ -d /tmp/workflows-backup/workflows ]; then
+            mkdir -p .github/workflows
+            find /tmp/workflows-backup/workflows -maxdepth 1 -type f \
+              -exec cp -a {} .github/workflows/ \;
+          fi
+
+      - name: Reapply approved demo-mode changes
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          def replace_any(text, patterns, replacement, label):
+              for pattern in patterns:
+                  new_text, count = re.subn(pattern, replacement, text, flags=re.M | re.S)
+                  if count:
+                      return new_text
+              raise SystemExit(f"[sync] Missing expected text for: {label}")
+
+          def replace_all(text, pattern, replacement, label):
+              new_text, count = re.subn(pattern, replacement, text, flags=re.M | re.S)
+              if count == 0:
+                  raise SystemExit(f"[sync] Missing expected text for: {label}")
+              return new_text
+
+          root = Path(".")
+          targets = [
+              root / "Natives/LauncherMenuViewController.m",
+              root / "Natives/authenticator/MicrosoftAuthenticator.m",
+              root / "JavaApp/src/launcher/net/kdt/pojavlaunch/Tools.java",
+              root / "Natives/MinecraftResourceDownloadTask.m",
+          ]
+          for file_path in targets:
+              if not file_path.exists():
+                  raise SystemExit(f"[sync] Missing file: {file_path}")
+
+          p = root / "Natives/LauncherMenuViewController.m"
+          text = p.read_text()
+          text = replace_any(
+              text,
+              [r'BOOL\s+isDemo\s*=\s*\[selected\[@"username"\]\s+hasPrefix:@"Demo\."\]\s*;'],
+              "BOOL isDemo = NO;",
+              "LauncherMenuViewController.m -> disable demo detection",
+          )
+          text = replace_any(
+              text,
+              [r'NSMutableAttributedString\s+\*title\s*=\s*\[\[NSMutableAttributedString alloc\]\s*initWithString:\[selected\[@"username"\]\s+substringFromIndex:\(\s*isDemo\s*\?\s*5\s*:\s*0\s*\)\]\];'],
+              'NSMutableAttributedString *title = [[NSMutableAttributedString alloc] initWithString:selected[@"username"]];',
+              "LauncherMenuViewController.m -> keep full username in title",
+          )
+          text = replace_any(
+              text,
+              [r'BOOL\s+shouldUpdateProfiles\s*=\s*\(getenv\("DEMO_LOCK"\)\s*!=\s*NULL\)\s*!=\s*isDemo\s*;'],
+              'BOOL shouldUpdateProfiles = getenv("DEMO_LOCK") != NULL;',
+              "LauncherMenuViewController.m -> keep profile refresh behavior",
+          )
+          text = replace_all(
+              text,
+              r'^\s*setenv\("DEMO_LOCK",\s*"1",\s*1\);\s*setenv\("POJAV_GAME_DIR",\s*\[NSString stringWithFormat:@"%s/\.demo",\s*getenv\("POJAV_HOME"\)\]\.UTF8String,\s*1\);\s*$',
+              "",
+              "LauncherMenuViewController.m -> remove demo env setup",
+          )
+          p.write_text(text)
+
+          p = root / "Natives/authenticator/MicrosoftAuthenticator.m"
+          text = p.read_text()
+          text = replace_any(
+              text,
+              [r'self\.authData\[@"username"\]\s*=\s*\[NSString stringWithFormat:@"Demo\.\%@",\s*self\.authData\[@"xboxGamertag"\]\s*\]\s*;'],
+              'self.authData[@"username"] = self.authData[@"xboxGamertag"];',
+              "MicrosoftAuthenticator.m -> remove Demo. fallback username",
+          )
+          text = replace_any(
+              text,
+              [r'callback\(@"DEMO",\s*YES\);'],
+              "callback(nil, YES);",
+              "MicrosoftAuthenticator.m -> stop marking fallback auth as demo",
+          )
+          p.write_text(text)
+
+          p = root / "JavaApp/src/launcher/net/kdt/pojavlaunch/Tools.java"
+          text = p.read_text()
+          text = replace_any(
+              text,
+              [
+                  r'if\s*\(\s*profile\.username\.startsWith\("Demo\."\)\s*\)\s*\{\s*strList\.add\("--demo"\);\s*\}',
+                  r'if\s*\(\s*profile\.username\.startsWith\("Demo\."\)\s*\)\s*\{\s*strList\.add\("--demo"\);\s*\}\s*else\s*\{\s*\}',
+              ],
+              'if(profile.username.startsWith("Demo.")) { }',
+              "Tools.java -> remove --demo launch arg",
+          )
+          p.write_text(text)
+
+          p = root / "Natives/MinecraftResourceDownloadTask.m"
+          text = p.read_text()
+          text = replace_any(
+              text,
+              [r'(BOOL\s+accessible\s*=\s*\[BaseAuthenticator\.current\.authData\[@"username"\]\s+hasPrefix:@"Demo\."\]\s*\|\|\s*BaseAuthenticator\.current\.authData\[@"xboxGamertag"\]\s*!=\s*nil\s*;)'],
+              r'\1\n    accessible = YES;',
+              "MinecraftResourceDownloadTask.m -> patch accesibility download.",
+          )
+          p.write_text(text)
+          PY
+
+      - name: Reapply build-fix patch (missing system headers)
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+          def insert_after(text, anchor_pattern, insertion, label):
+              if insertion.strip() in text:
+                  return text  # upstream already has it, nothing to do
+              new_text, count = re.subn(
+                  anchor_pattern,
+                  lambda m: m.group(0) + insertion,
+                  text,
+                  count=1,
+                  flags=re.M,
+              )
+              if count == 0:
+                  raise SystemExit(f"[sync] Missing expected anchor for: {label}")
+              return new_text
+          root = Path(".")
+          p = root / "Natives/JavaLauncher.m"
+          text = p.read_text()
+          text = insert_after(
+              text,
+              r'^#include <unistd\.h>\n',
+              "#include <sys/mman.h>\n",
+              "JavaLauncher.m -> add sys/mman.h for mmap/munmap",
+          )
+          text = insert_after(
+              text,
+              r'^#include <sys/mman\.h>\n',
+              "#include <mach/mach.h>\n",
+              "JavaLauncher.m -> add mach/mach.h for mach_task_self/task_set_exception_ports",
+          )
+          p.write_text(text)
+          p = root / "Natives/main_hook.m"
+          text = p.read_text()
+          text = insert_after(
+              text,
+              r'^#include <pthread\.h>\n',
+              "#include <mach/mach.h>\n",
+              "main_hook.m -> add mach/mach.h for mach_task_self etc.",
+          )
+          p.write_text(text)
+          p = root / "Natives/input_bridge_v3.m"
+          text = p.read_text()
+          text = insert_after(
+              text,
+              r'^#include <stdatomic\.h>\n',
+              "#include <sys/mman.h>\n#include <mach/vm_param.h>\n",
+              "input_bridge_v3.m -> add sys/mman.h + mach/vm_param.h for mmap/mprotect/PAGE_SIZE",
+          )
+          p.write_text(text)
+          p = root / "Natives/utils.m"
+          text = p.read_text()
+          text = insert_after(
+              text,
+              r'^#include <dirent\.h>\n',
+              "#include <sys/mman.h>\n",
+              "utils.m -> add sys/mman.h for mmap/mprotect/munmap",
+          )
+          p.write_text(text)
+          PY
+
+      - name: Reapply build-fix patch (UISolariumEnabled undefined symbol)
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+          import re
+
+          def insert_after(text, anchor_pattern, insertion, label):
+              if insertion.strip() in text:
+                  return text  # already applied, nothing to do
+              new_text, count = re.subn(
+                  anchor_pattern,
+                  lambda m: m.group(0) + insertion,
+                  text,
+                  count=1,
+                  flags=re.M,
+              )
+              if count == 0:
+                  raise SystemExit(f"[sync] Missing expected anchor for: {label}")
+              return new_text
+
+          root = Path(".")
+          p = root / "Makefile"
+          text = p.read_text()
+          text = insert_after(
+              text,
+              r'^\t\t-DCMAKE_C_FLAGS="-arch arm64" \\\n',
+              '\t\t-DCMAKE_EXE_LINKER_FLAGS="-Wl,-U,__UISolariumEnabled" \\\n',
+              "Makefile -> allow undefined weak-imported _UISolariumEnabled at link time",
+          )
+          p.write_text(text)
+          PY
+
+      - name: Show changes
+        run: |
+          git status --short
+          git diff --stat
+
+      - name: Commit synced result
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "Sync upstream and reapply approved patches"
+
+      - name: Push updated branch
+        run: |
+          git push --force-with-lease origin HEAD:main

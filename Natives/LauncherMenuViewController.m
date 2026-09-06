@@ -287,11 +287,11 @@
     }
 
     // Remove the prefix "Demo." if there is
-    BOOL isDemo = [selected[@"username"] hasPrefix:@"Demo."];
-    NSMutableAttributedString *title = [[NSMutableAttributedString alloc] initWithString:[selected[@"username"] substringFromIndex:(isDemo?5:0)]];
+    BOOL isDemo = NO;
+    NSMutableAttributedString *title = [[NSMutableAttributedString alloc] initWithString:selected[@"username"]];
 
     // Check if we're switching between demo and full mode
-    BOOL shouldUpdateProfiles = (getenv("DEMO_LOCK")!=NULL) != isDemo;
+    BOOL shouldUpdateProfiles = getenv("DEMO_LOCK") != NULL;
 
     // Reset states
     unsetenv("DEMO_LOCK");
@@ -300,8 +300,7 @@
     id subtitle;
     if (isDemo) {
         subtitle = localize(@"login.option.demo", nil);
-        setenv("DEMO_LOCK", "1", 1);
-        setenv("POJAV_GAME_DIR", [NSString stringWithFormat:@"%s/.demo", getenv("POJAV_HOME")].UTF8String, 1);
+
     } else if (selected[@"xboxGamertag"] == nil) {
         subtitle = localize(@"login.option.local", nil);
     } else {
