@@ -1,0 +1,416 @@
+name: fix development (once)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.SYNC_PAT }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Backup local workflows
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/workflows-backup
+          if [ -d .github/workflows ]; then
+            cp -a .github/workflows /tmp/workflows-backup/
+          fi
+
+      - name: Add upstream remote
+        run: |
+          git remote get-url upstream >/dev/null 2>&1 || \
+            git remote add upstream https://github.com/AngelAuraMC/Amethyst-iOS.git
+          git fetch upstream main --prune
+
+      - name: Reset to upstream main
+        run: |
+          git checkout -B main upstream/main
+          git reset --hard upstream/main
+
+      - name: Restore fork-only workflow files
+        run: |
+          set -euo pipefail
+          if [ -d /tmp/workflows-backup/workflows ]; then
+            mkdir -p .github/workflows
+            find /tmp/workflows-backup/workflows -maxdepth 1 -type f \
+              ! -name 'release.yml' ! -name 'development.yml' \
+              -exec cp -a {} .github/workflows/ \;
+          fi
+
+      - name: Install patch dependencies
+        run: pip install --break-system-packages --quiet ruamel.yaml
+
+      - name: Reapply approved development-workflow changes
+        run: |
+          python3 <<'PY'
+          from pathlib import Path
+
+          PATH = Path(".github/workflows/development.yml")
+
+          def fail(label):
+              raise SystemExit(f"[sync] development.yml: {label}")
+
+          def patch(text, old, new, label):
+              if old in text:
+                  return text.replace(old, new, 1)
+              if not new.strip():
+                  return text  # removal-type patch already applied
+              if new.strip() in text:
+                  return text  # already applied, idempotent no-op
+              fail(f"anchor not found for: {label}")
+
+          text = PATH.read_text()
+
+          # Triggers: workflow_dispatch only
+          text = patch(
+              text,
+              'on:\n'
+              '  pull_request:\n'
+              "    branches-ignore:\n"
+              "      - 'l10n_main'\n"
+              '    types: [opened, reopened]\n'
+              '  push:\n'
+              "    branches-ignore:\n"
+              "      - 'l10n_main'\n"
+              '  workflow_dispatch:\n',
+              'on:\n'
+              '  workflow_dispatch:\n',
+              "triggers -> workflow_dispatch only",
+          )
+
+          # Runner: target macos-26 (toolchain-gap fix -- upstream's own
+          # runner builds with AppleClang 21.0.0 / Xcode ~26.4-26.5)
+          text = patch(
+              text,
+              '    runs-on: J316sAP\n',
+              '    runs-on: macos-26\n',
+              "runs-on -> macos-26",
+          )
+          if '    runs-on: macos-15\n' in text:
+              text = patch(
+                  text,
+                  '    runs-on: macos-15\n',
+                  '    runs-on: macos-26\n',
+                  "runs-on macos-15 -> macos-26",
+              )
+
+          # Remove the dead gl4es block (all its steps are if:false upstream)
+          text = patch(
+              text,
+              '      - name: Get gl4es latest commit hash\n'
+              '        id: gl4es-sha\n'
+              "        run: echo \"::set-output name=sha::$(echo $(git ls-remote https://github.com/PojavLauncherTeam/gl4es-114-extra refs/heads/master | grep -io '^\\S*'))\"\n"
+              '        shell: bash\n'
+              '\n'
+              '      - name: Cache gl4es\n'
+              '        uses: actions/cache@main\n'
+              '        if: false # use gl4es 1.1.5\n'
+              '        id: gl4es-cache\n'
+              '        with:\n'
+              '          path: gl4es/libs\n'
+              '          key: gl4es-holy-ios-shared-2-${{ steps.gl4es-sha.outputs.sha }}\n'
+              '\n'
+              '      - name: Get gl4es\n'
+              "        if: false && steps.gl4es-cache.outputs.cache-hit != 'true'\n"
+              '        uses: actions/checkout@main\n'
+              '        with:\n'
+              "          repository: 'PojavLauncherTeam/gl4es-114-extra'\n"
+              "          path: 'gl4es'\n"
+              '\n'
+              '      - name: Build gl4es\n'
+              "        if: false && steps.gl4es-cache.outputs.cache-hit != 'true'\n"
+              '        continue-on-error: true\n'
+              '        run: |\n'
+              '          cd gl4es\n'
+              '          git config user.email "github-actions@users.noreply.github.com"\n'
+              '          git config user.name "github-actions"\n'
+              '          export PATH=/opt/procursus/bin:$PATH\n'
+              '          wget https://github.com/leetal/ios-cmake/raw/master/ios.toolchain.cmake\n'
+              '          cmake -B build -DCMAKE_TOOLCHAIN_FILE=ios.toolchain.cmake -DDEFAULT_ES=2 \\\n'
+              '            -DNOX11=ON -DNOEGL=OFF -DSTATICLIB=OFF -DPLATFORM=OS64 \\\n'
+              '            -DCMAKE_C_FLAGS=-Wno-error=implicit-function-declaration\n'
+              '          cmake --build build --config RelWithDebInfo --target GL\n'
+              '          cp -R lib/libGL.dylib ../Natives/resources/Frameworks/libgl4es_114.dylib\n'
+              '          \n'
+              '      - name: Push gl4es\n'
+              "        if: false && github.event != 'pull_request' && github.ref_name == 'main' && steps.gl4es-cache.outputs.cache-hit != 'true'\n"
+              '        continue-on-error: true\n'
+              '        run: |\n'
+              '          git add Natives/resources/Frameworks/libgl4es_114.dylib\n'
+              '          git commit -am "CI: Update gl4es"\n'
+              '          git push\n'
+              '\n',
+              '',
+              "remove dead gl4es block",
+          )
+
+          # Bootstrap steps inserted right after submodule checkout
+          text = patch(
+              text,
+              '      - name: Checkout repository submodules\n'
+              '        run: git submodule update --init --recursive\n',
+              '      - name: Checkout repository submodules\n'
+              '        run: git submodule update --init --recursive\n'
+              '      - name: Install dpkg\n'
+              '        run: |\n'
+              '          brew install dpkg fakeroot || true\n'
+              '      - name: Install GNU Make (gmake)\n'
+              '        run: brew install make\n'
+              '      - name: Install JDK 8\n'
+              '        run: |\n'
+              '          brew install --cask temurin@8\n'
+              '          java -version\n'
+              '      - name: Install ldid\n'
+              '        run: brew install ldid\n',
+              "insert bootstrap steps",
+          )
+
+          # Build step: single ios gmake call, no SLIMMED, no second
+          # TROLLSTORE_JIT_ENT pass
+          text = patch(
+              text,
+              '      - name: Build for ${{ matrix.platform_name }}\n'
+              '        run: |\n'
+              '          export PATH=/opt/homebrew/bin:$PATH\n'
+              '          export SLIMMED=1\n'
+              '          if [ "${{ matrix.platform_name }}" == "ios" ]; then\n'
+              '            # Build ipa and tipa for iOS\n'
+              '            gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=${{ matrix.platform }}\n'
+              '            gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=${{ matrix.platform }} TROLLSTORE_JIT_ENT=1\n'
+              '          elif [ "${{ matrix.platform_name }}" == "tvos" ]; then\n'
+              '            # Build tipa only for tvOS\n'
+              '            gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=${{ matrix.platform }} TROLLSTORE_JIT_ENT=1\n'
+              '          else\n'
+              '            # Build ipa only for everything else\n'
+              '            gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=${{ matrix.platform }}\n'
+              '          fi\n',
+              '      - name: Build for ${{ matrix.platform_name }}\n'
+              '        run: |\n'
+              '          export PATH=/usr/sbin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin\n'
+              '          sysctl -n hw.ncpu\n'
+              '          gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=${{ matrix.platform }}\n',
+              "simplify build step",
+          )
+
+          # Drop tipa/slimmed/dSYM upload steps, keep only the regular ipa
+          text = patch(
+              text,
+              '      - name: Upload regular tipa\n'
+              '        uses: actions/upload-artifact@main\n'
+              '        with:\n'
+              '          name: org.angelauramc.amethyst-${{ matrix.platform_name }}-trollstore.tipa\n'
+              '          path: artifacts/org.angelauramc.amethyst-*-${{ matrix.platform_name }}-trollstore.tipa\n'
+              '\n'
+              '      - name: Upload slimmed ipa\n'
+              '        uses: actions/upload-artifact@main\n'
+              '        with:\n'
+              '          name: org.angelauramc.amethyst.slimmed-${{ matrix.platform_name }}.ipa\n'
+              '          path: artifacts/org.angelauramc.amethyst.slimmed-*-${{ matrix.platform_name }}.ipa\n'
+              '\n'
+              '      - name: Upload slimmed tipa\n'
+              '        uses: actions/upload-artifact@main\n'
+              '        with:\n'
+              '          name: org.angelauramc.amethyst.slimmed-${{ matrix.platform_name }}-trollstore.tipa\n'
+              '          path: artifacts/org.angelauramc.amethyst.slimmed-*-${{ matrix.platform_name }}-trollstore.tipa\n'
+              '\n'
+              '      - name: Upload PojavLauncher.dSYM\n'
+              '        uses: actions/upload-artifact@main\n'
+              "        if: matrix.platform_name == 'ios'\n"
+              '        with:\n'
+              '          name: AngelAuraAmethyst.dSYM\n'
+              '          path: artifacts/AngelAuraAmethyst.dSYM\n',
+              '',
+              "drop tipa/slimmed/dSYM upload steps",
+          )
+
+          PATH.write_text(text)
+          print("[sync] development.yml patched.")
+          PY
+          
+      #ctrl+/ : release is deprecated
+      # - name: Reapply approved release-workflow changes
+      #   run: |
+      #     python3 <<'PY'
+      #     from pathlib import Path
+      #     from io import StringIO
+      #     from ruamel.yaml import YAML
+      #     from ruamel.yaml.scalarstring import LiteralScalarString as LSS
+      #     import re
+
+      #     PATH = Path(".github/workflows/release.yml")
+
+      #     def fail(label):
+      #         raise SystemExit(f"[sync] release.yml: {label}")
+
+      #     def make_yaml():
+      #         y = YAML()
+      #         y.preserve_quotes = True
+      #         y.width = 4096
+      #         y.indent(mapping=2, sequence=4, offset=2)
+      #         return y
+
+      #     original_text = PATH.read_text()
+      #     yaml = make_yaml()
+      #     doc = yaml.load(original_text)
+
+      #     jobs = doc.get("jobs") or fail("no 'jobs' key")
+      #     build = jobs.get("build") or fail("no 'jobs.build' key")
+      #     steps = build.get("steps")
+      #     if steps is None:
+      #         fail("no 'jobs.build.steps' key")
+
+      #     def find_step(name, required=True):
+      #         for s in steps:
+      #             if s.get("name") == name:
+      #                 return s
+      #         if required:
+      #             fail(f"step not found: {name!r}")
+      #         return None
+
+      #     def find_index(name, required=True):
+      #         for i, s in enumerate(steps):
+      #             if s.get("name") == name:
+      #                 return i
+      #         if required:
+      #             fail(f"step not found: {name!r}")
+      #         return None
+
+      #     changed = False
+
+      #     # 1) runs-on -> macos-26 (toolchain-gap fix, same reasoning as
+      #     #    development.yml)
+      #     TARGET_RUNNER = "macos-26"
+      #     runs_on = build.get("runs-on")
+      #     if runs_on != TARGET_RUNNER:
+      #         build["runs-on"] = TARGET_RUNNER
+      #         changed = True
+
+      #     # 2) drop the cleanup step that needs a runner-local sudo password
+      #     #    (upstream's own machine's admin password -- not available,
+      #     #    not needed, on a GitHub-hosted runner, which is passwordless
+      #     #    sudo by default)
+      #     idx = find_index("Remove work folders", required=False)
+      #     if idx is not None:
+      #         run_body = str(steps[idx].get("run", ""))
+      #         if "sudo -S rm -rf" in run_body:
+      #             del steps[idx]
+      #             changed = True
+
+      #     # 3) drop any explicit Xcode pin -- macos-26's default already
+      #     #    matches what upstream uses
+      #     for i in range(len(steps) - 1, -1, -1):
+      #         name = str(steps[i].get("name", ""))
+      #         if name.lower().startswith("select xcode"):
+      #             del steps[i]
+      #             changed = True
+
+      #     # 4) pin actions to versioned tags instead of @main
+      #     PINS = {
+      #         "actions/checkout@main": "actions/checkout@v4",
+      #         "actions/cache@main": "actions/cache@v4",
+      #         "actions/upload-artifact@main": "actions/upload-artifact@v4",
+      #     }
+      #     for s in steps:
+      #         uses = s.get("uses")
+      #         if uses in PINS:
+      #             s["uses"] = PINS[uses]
+      #             changed = True
+
+      #     # 5) toolchain bootstrap steps -- same set as development.yml,
+      #     #    inserted right after submodule checkout if missing
+      #     BOOTSTRAP_STEPS = [
+      #         ("Install dpkg", LSS("brew install dpkg fakeroot || true\n")),
+      #         ("Install GNU Make (gmake)", LSS("brew install make\n")),
+      #         ("Install JDK 8", LSS("brew install --cask temurin@8\njava -version\n")),
+      #         ("Install ldid", LSS("brew install ldid\n")),
+      #     ]
+      #     anchor_idx = find_index("Checkout repository submodules", required=False)
+      #     insert_at = (anchor_idx + 1) if anchor_idx is not None else 0
+      #     for name, run_body in reversed(BOOTSTRAP_STEPS):
+      #         if find_step(name, required=False) is None:
+      #             steps.insert(insert_at, {"name": name, "run": run_body})
+      #             changed = True
+
+      #     # 6) drop any forced CFLAGS/CXXFLAGS override
+      #     CFLAGS_RE = re.compile(r'^[ \t]*export CX{0,2}FLAGS=.*\n', re.M)
+      #     for s in steps:
+      #         run_body = s.get("run")
+      #         if run_body is None:
+      #             continue
+      #         text = str(run_body)
+      #         new_text = CFLAGS_RE.sub("", text)
+      #         if new_text != text:
+      #             s["run"] = LSS(new_text) if isinstance(run_body, LSS) else new_text
+      #             changed = True
+
+      #     # 7) PATH fixups for a vanilla Homebrew runner instead of a
+      #     #    Procursus/jailbreak-toolchain layout
+      #     for s in steps:
+      #         run_body = s.get("run")
+      #         if run_body is None:
+      #             continue
+      #         text = str(run_body)
+      #         new_text = text.replace(
+      #             "export PATH=/opt/procursus/bin:/opt/homebrew/bin:$PATH",
+      #             "export PATH=/opt/homebrew/bin:/opt/homebrew/opt/make/libexec/gnubin:$PATH",
+      #         ).replace(
+      #             "export PATH=/opt/procursus/bin:$PATH",
+      #             "export PATH=/opt/homebrew/bin:$PATH",
+      #         )
+      #         if new_text != text:
+      #             s["run"] = LSS(new_text) if isinstance(run_body, LSS) else new_text
+      #             changed = True
+
+      #     # 8) drop the same runner-local-password env wherever it shows up
+      #     #    (e.g. on the build step too)
+      #     for s in steps:
+      #         env = s.get("env")
+      #         if env and "password" in env and "ELLIE_MINI_SECRET" in str(env.get("password", "")):
+      #             del s["env"]
+      #             changed = True
+
+      #     if not changed:
+      #         print("[sync] release.yml already up to date, nothing to do.")
+      #         raise SystemExit(0)
+
+      #     buf = StringIO()
+      #     yaml.dump(doc, buf)
+      #     PATH.write_text(buf.getvalue())
+      #     print("[sync] release.yml patched.")
+      #     PY
+
+      - name: Show changes
+        run: |
+          git status --short
+          git diff --stat
+
+      - name: Commit synced result
+        run: |
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "Sync upstream and reapply approved toolchain patches"
+
+      - name: Push updated branch
+        run: |
+          git push --force-with-lease origin HEAD:main
