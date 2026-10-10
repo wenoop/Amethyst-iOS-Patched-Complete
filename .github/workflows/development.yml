@@ -27,8 +27,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@main
 
+      
       - name: Checkout repository submodules
-        run: git submodule update --init --recursive
+        run: |
+          git -c http.https://github.com/.extraheader= submodule update --init --recursive
+
 
       # No explicit Xcode pin needed — macos-26's default is already
       # Xcode 26.4.1 as of May 2026, matching what upstream's log showed.
