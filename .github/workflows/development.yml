@@ -1,3 +1,4 @@
+
 name: Development build
 
 on:
@@ -27,11 +28,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@main
 
-            - name: Checkout repository submodules
+      - name: Checkout repository submodules
         shell: bash
         run: |
           set -euo pipefail
 
+          # Return success only if the exact requested commit exists
+          # in the source repository.
           source_has_commit() {
             local url="$1"
             local sha="$2"
@@ -53,6 +56,7 @@ jobs:
             return 1
           }
 
+          # Look up the actual submodule name from .gitmodules.
           submodule_name_for_path() {
             git config -f .gitmodules --get-regexp \
               '^submodule\..*\.path$' |
@@ -74,28 +78,31 @@ jobs:
             local branch="$4"
             local sha
             local module_name
+            local selected
 
             sha="$(git ls-tree HEAD -- "$path" |
               awk '$1 == "160000" { print $3 }')"
 
             if [[ -z "$sha" ]]; then
-              echo "::error::Missing pinned commit for $path"
+              echo "::error::Could not find pinned commit for $path"
               return 1
             fi
 
             module_name="$(submodule_name_for_path "$path")"
 
             if [[ -z "$module_name" ]]; then
-              echo "::error::Missing .gitmodules entry for $path"
+              echo "::error::Could not find submodule name for $path"
               return 1
             fi
 
-            # First preference: original source with the exact pinned commit.
+            # 1. Prefer the original source if it contains the pinned commit.
             if source_has_commit "$original" "$sha"; then
+              selected="$original"
+
               echo "::notice::Using original source for $path ($sha)"
 
               git config --local --replace-all \
-                "submodule.${module_name}.url" "$original"
+                "submodule.${module_name}.url" "$selected"
 
               git -c http.https://github.com/.extraheader= \
                 submodule update --init --recursive -- "$path"
@@ -103,12 +110,14 @@ jobs:
               return 0
             fi
 
-            # Second preference: mirror with the exact pinned commit.
+            # 2. Otherwise, use the mirror if it contains the pinned commit.
             if source_has_commit "$fallback" "$sha"; then
+              selected="$fallback"
+
               echo "::notice::Using fallback with pinned commit for $path ($sha)"
 
               git config --local --replace-all \
-                "submodule.${module_name}.url" "$fallback"
+                "submodule.${module_name}.url" "$selected"
 
               git -c http.https://github.com/.extraheader= \
                 submodule update --init --recursive -- "$path"
@@ -116,54 +125,70 @@ jobs:
               return 0
             fi
 
-            # Last resort: the mirror is reachable but does not contain
-            # the original gitlink. Use its designated branch tip instead.
-            # This is a different commit, so report it explicitly.
+            # 3. Neither source has the pinned commit.
+            # Use the fallback branch tip only if that branch exists.
             if GIT_TERMINAL_PROMPT=0 git \
               -c http.https://github.com/.extraheader= \
               ls-remote --exit-code --heads "$fallback" \
               "refs/heads/$branch" >/dev/null 2>&1; then
 
-              echo "::warning::Pinned commit $sha is unavailable for $path."
-              echo "::warning::Falling back to $fallback branch $branch."
+              echo "::warning::Pinned commit $sha is unavailable for $path"
+              echo "::warning::Using fallback branch $branch from $fallback"
 
-              git submodule deinit -f -- "$path" >/dev/null 2>&1 || true
+              # Remove any partially initialized submodule worktree.
+              git submodule deinit -f -- "$path" \
+                >/dev/null 2>&1 || true
+
               rm -rf "$path"
               mkdir -p "$(dirname "$path")"
 
+              # This fallback intentionally checks out the branch tip,
+              # not the original pinned commit.
               GIT_TERMINAL_PROMPT=0 git \
                 -c http.https://github.com/.extraheader= \
                 clone --quiet --depth 1 --single-branch \
                 --branch "$branch" "$fallback" "$path"
 
-              echo "::notice::Fallback checkout:"
+              echo "::notice::Actual fallback commit for $path:"
               git -C "$path" log -1 --format='%H %s'
+
               return 0
             fi
 
-            echo "::error::Original and fallback sources are unavailable for $path"
-            echo "::error::Pinned commit: $sha"
+            echo "::error::No usable source found for $path"
+            echo "::error::Original pinned commit: $sha"
             echo "::error::Fallback branch: $branch"
             return 1
           }
 
-          # Keep the other original dependencies pinned normally.
+          # Keep AFNetworking and MobileGlues on their original URLs.
           git -c http.https://github.com/.extraheader= \
             submodule update --init --recursive -- \
             Natives/external/AFNetworking \
             Natives/external/MobileGlues
 
+          # DBNumberedSlider:
+          # original repository first, then the archived public mirror.
           prepare_submodule \
             "Natives/external/DBNumberedSlider" \
             "https://github.com/khanhduytran0/DBNumberedSlider.git" \
             "https://github.com/immago/DBNumberedSlider.git" \
             "master"
 
+          # fishhook:
+          # preserve jev/main whenever its pinned commit is available.
           prepare_submodule \
             "Natives/external/fishhook" \
             "https://github.com/khanhduytran0/fishhook.git" \
             "https://github.com/jevinskie/fishhook.git" \
             "jev/main"
+
+      # macos-26 supplies the runner's default Xcode installation.
+      # To pin a particular installed Xcode version, uncomment and
+      # adjust this step to match the runner's available application.
+      #
+      # - name: Select Xcode
+      #   run: sudo xcode-select -s /Applications/Xcode_26.4.1.app
 
       - name: Install dpkg
         run: |
@@ -181,10 +206,15 @@ jobs:
         run: brew install ldid
 
       - name: Build for ${{ matrix.platform_name }}
+        shell: bash
         run: |
+          set -euo pipefail
           export PATH=/usr/sbin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
+
           sysctl -n hw.ncpu
-          gmake -j"$(sysctl -n hw.ncpu)" dsym package PLATFORM=${{ matrix.platform }}
+
+          gmake -j"$(sysctl -n hw.ncpu)" \
+            dsym package PLATFORM=${{ matrix.platform }}
 
       - name: Upload regular ipa
         uses: actions/upload-artifact@main
