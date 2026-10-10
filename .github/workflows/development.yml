@@ -27,13 +27,11 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@main
 
-      - name: Checkout repository submodules
+            - name: Checkout repository submodules
         shell: bash
         run: |
           set -euo pipefail
 
-          # Check whether a remote contains the exact commit pinned
-          # by the parent repository.
           source_has_commit() {
             local url="$1"
             local sha="$2"
@@ -55,84 +53,117 @@ jobs:
             return 1
           }
 
-          # Try the original repository first. Use the fallback only
-          # when it contains the exact commit required by this build.
-          select_submodule_url() {
+          submodule_name_for_path() {
+            git config -f .gitmodules --get-regexp \
+              '^submodule\..*\.path$' |
+            awk -v target="$1" '
+              $2 == target {
+                name = $1
+                sub(/^submodule\./, "", name)
+                sub(/\.path$/, "", name)
+                print name
+                exit
+              }
+            '
+          }
+
+          prepare_submodule() {
             local path="$1"
             local original="$2"
             local fallback="$3"
+            local branch="$4"
             local sha
-            local selected
             local module_name
 
             sha="$(git ls-tree HEAD -- "$path" |
               awk '$1 == "160000" { print $3 }')"
 
             if [[ -z "$sha" ]]; then
-              echo "::error::Could not find pinned commit for $path"
+              echo "::error::Missing pinned commit for $path"
               return 1
             fi
 
-            if source_has_commit "$original" "$sha"; then
-              selected="$original"
-              echo "::notice::Using original source for $path ($sha)"
-
-            elif source_has_commit "$fallback" "$sha"; then
-              selected="$fallback"
-              echo "::warning::Original source unavailable or missing commit; using fallback for $path ($sha)"
-
-            else
-              echo "::error::Neither source contains pinned commit $sha for $path"
-              return 1
-            fi
-
-            # Resolve the actual submodule name from .gitmodules instead
-            # of assuming it is identical to the working-tree path.
-            module_name="$(
-              git config -f .gitmodules --get-regexp \
-                '^submodule\..*\.path$' |
-              awk -v path="$path" '
-                $2 == path {
-                  name = $1
-                  sub(/^submodule\./, "", name)
-                  sub(/\.path$/, "", name)
-                  print name
-                  exit
-                }
-              '
-            )"
+            module_name="$(submodule_name_for_path "$path")"
 
             if [[ -z "$module_name" ]]; then
-              echo "::error::Could not find submodule name for $path"
+              echo "::error::Missing .gitmodules entry for $path"
               return 1
             fi
 
-            # Change only local Git configuration, not .gitmodules.
-            git config --local --replace-all \
-              "submodule.${module_name}.url" "$selected"
+            # First preference: original source with the exact pinned commit.
+            if source_has_commit "$original" "$sha"; then
+              echo "::notice::Using original source for $path ($sha)"
+
+              git config --local --replace-all \
+                "submodule.${module_name}.url" "$original"
+
+              git -c http.https://github.com/.extraheader= \
+                submodule update --init --recursive -- "$path"
+
+              return 0
+            fi
+
+            # Second preference: mirror with the exact pinned commit.
+            if source_has_commit "$fallback" "$sha"; then
+              echo "::notice::Using fallback with pinned commit for $path ($sha)"
+
+              git config --local --replace-all \
+                "submodule.${module_name}.url" "$fallback"
+
+              git -c http.https://github.com/.extraheader= \
+                submodule update --init --recursive -- "$path"
+
+              return 0
+            fi
+
+            # Last resort: the mirror is reachable but does not contain
+            # the original gitlink. Use its designated branch tip instead.
+            # This is a different commit, so report it explicitly.
+            if GIT_TERMINAL_PROMPT=0 git \
+              -c http.https://github.com/.extraheader= \
+              ls-remote --exit-code --heads "$fallback" \
+              "refs/heads/$branch" >/dev/null 2>&1; then
+
+              echo "::warning::Pinned commit $sha is unavailable for $path."
+              echo "::warning::Falling back to $fallback branch $branch."
+
+              git submodule deinit -f -- "$path" >/dev/null 2>&1 || true
+              rm -rf "$path"
+              mkdir -p "$(dirname "$path")"
+
+              GIT_TERMINAL_PROMPT=0 git \
+                -c http.https://github.com/.extraheader= \
+                clone --quiet --depth 1 --single-branch \
+                --branch "$branch" "$fallback" "$path"
+
+              echo "::notice::Fallback checkout:"
+              git -C "$path" log -1 --format='%H %s'
+              return 0
+            fi
+
+            echo "::error::Original and fallback sources are unavailable for $path"
+            echo "::error::Pinned commit: $sha"
+            echo "::error::Fallback branch: $branch"
+            return 1
           }
 
-          select_submodule_url \
+          # Keep the other original dependencies pinned normally.
+          git -c http.https://github.com/.extraheader= \
+            submodule update --init --recursive -- \
+            Natives/external/AFNetworking \
+            Natives/external/MobileGlues
+
+          prepare_submodule \
             "Natives/external/DBNumberedSlider" \
             "https://github.com/khanhduytran0/DBNumberedSlider.git" \
-            "https://github.com/immago/DBNumberedSlider.git"
+            "https://github.com/immago/DBNumberedSlider.git" \
+            "master"
 
-          select_submodule_url \
+          prepare_submodule \
             "Natives/external/fishhook" \
             "https://github.com/khanhduytran0/fishhook.git" \
-            "https://github.com/jevinskie/fishhook.git"
-
-          # Initialize all dependencies at the exact pinned commits.
-          # AFNetworking and MobileGlues retain their original URLs.
-          git -c http.https://github.com/.extraheader= \
-            submodule update --init --recursive
-
-      # No explicit Xcode pin needed — macos-26's default is expected
-      # to provide the Xcode version used by the upstream build.
-      #
-      # If you want to lock it down for reproducibility instead:
-      # - name: Select Xcode
-      #   run: sudo xcode-select -s /Applications/Xcode_26.4.1.app
+            "https://github.com/jevinskie/fishhook.git" \
+            "jev/main"
 
       - name: Install dpkg
         run: |
