@@ -119,7 +119,7 @@ jobs:
           )
           text = replace_all(
               text,
-              r'^\s*setenv\("DEMO_LOCK",\s*"1",\s*1\);\s*setenv\("POJAV_GAME_DIR",\s*\[NSString stringWithFormat:@"%s/\.demo",\s*getenv\("POJAV_HOME"\)\]\.UTF8String,\s*1\);\s*$',
+              r'^[ \t]*setenv\("DEMO_LOCK",[ \t]*"1",[ \t]*1\);[ \t]*\n[ \t]*setenv\("GAME_DIR",[ \t]*\[NSString stringWithFormat:@"%s/\.demo",[ \t]*getenv\("AME_HOME"\)\]\.UTF8String,[ \t]*1\);[ \t]*$',
               "",
               "LauncherMenuViewController.m -> remove demo env setup",
           )
