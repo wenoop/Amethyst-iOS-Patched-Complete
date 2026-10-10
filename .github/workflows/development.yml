@@ -1,29 +1,18 @@
-
 name: Development build
 
 on:
-  pull_request:
-    branches-ignore:
-      - 'l10n_main'
-    types: [opened, reopened]
-
-  push:
-    branches-ignore:
-      - 'l10n_main'
-
   workflow_dispatch:
 
 jobs:
   build:
     name: Development build
-
     strategy:
       matrix:
         include:
           - platform: 2
             platform_name: ios
 
-    runs-on: J316sAP
+    runs-on: macos-26
 
     steps:
       - name: Remove work folders
@@ -43,8 +32,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          # Test whether a repository contains the exact gitlink commit.
-          # Failed probes are expected when a repository is unavailable.
+          # Check whether a remote contains the exact commit pinned
+          # by the parent repository.
           source_has_commit() {
             local url="$1"
             local sha="$2"
@@ -66,15 +55,15 @@ jobs:
             return 1
           }
 
-          # Use the original repository whenever it has the pinned commit.
-          # Use a fallback only if the original cannot provide that commit
-          # and the fallback can.
+          # Try the original repository first. Use the fallback only
+          # when it contains the exact commit required by this build.
           select_submodule_url() {
             local path="$1"
             local original="$2"
             local fallback="$3"
             local sha
             local selected
+            local module_name
 
             sha="$(git ls-tree HEAD -- "$path" |
               awk '$1 == "160000" { print $3 }')"
@@ -87,140 +76,87 @@ jobs:
             if source_has_commit "$original" "$sha"; then
               selected="$original"
               echo "::notice::Using original source for $path ($sha)"
+
             elif source_has_commit "$fallback" "$sha"; then
               selected="$fallback"
-              echo "::warning::Original source unavailable or missing $sha; using fallback for $path"
+              echo "::warning::Original source unavailable or missing commit; using fallback for $path ($sha)"
+
             else
               echo "::error::Neither source contains pinned commit $sha for $path"
               return 1
             fi
 
-            # Store the selected URL locally. Do not run
-            # 'git submodule sync' afterwards; that would restore the
-            # URL from .gitmodules and discard this conditional selection.
+            # Resolve the actual submodule name from .gitmodules instead
+            # of assuming it is identical to the working-tree path.
+            module_name="$(
+              git config -f .gitmodules --get-regexp \
+                '^submodule\..*\.path$' |
+              awk -v path="$path" '
+                $2 == path {
+                  name = $1
+                  sub(/^submodule\./, "", name)
+                  sub(/\.path$/, "", name)
+                  print name
+                  exit
+                }
+              '
+            )"
+
+            if [[ -z "$module_name" ]]; then
+              echo "::error::Could not find submodule name for $path"
+              return 1
+            fi
+
+            # Change only local Git configuration, not .gitmodules.
             git config --local --replace-all \
-              "submodule.${path}.url" "$selected"
+              "submodule.${module_name}.url" "$selected"
           }
 
           select_submodule_url \
             "Natives/external/DBNumberedSlider" \
-            "https://github.com/khanhduytran0/DBNumberedSlider" \
+            "https://github.com/khanhduytran0/DBNumberedSlider.git" \
             "https://github.com/immago/DBNumberedSlider.git"
 
           select_submodule_url \
             "Natives/external/fishhook" \
-            "https://github.com/khanhduytran0/fishhook" \
+            "https://github.com/khanhduytran0/fishhook.git" \
             "https://github.com/jevinskie/fishhook.git"
 
-          # Initialize every dependency at its pinned commit.
-          # AFNetworking and MobileGlues continue using their original URLs.
+          # Initialize all dependencies at the exact pinned commits.
+          # AFNetworking and MobileGlues retain their original URLs.
           git -c http.https://github.com/.extraheader= \
             submodule update --init --recursive
 
-      - name: Get gl4es latest commit hash
-        id: gl4es-sha
-        shell: bash
+      # No explicit Xcode pin needed — macos-26's default is expected
+      # to provide the Xcode version used by the upstream build.
+      #
+      # If you want to lock it down for reproducibility instead:
+      # - name: Select Xcode
+      #   run: sudo xcode-select -s /Applications/Xcode_26.4.1.app
+
+      - name: Install dpkg
         run: |
-          SHA="$(git ls-remote \
-            https://github.com/PojavLauncherTeam/gl4es-114-extra \
-            refs/heads/master | awk 'NR == 1 { print $1 }')"
+          brew install dpkg fakeroot || true
 
-          if [ -z "$SHA" ]; then
-            echo "::error::Could not resolve gl4es master commit"
-            exit 1
-          fi
+      - name: Install GNU Make (gmake)
+        run: brew install make
 
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-
-      - name: Cache gl4es
-        if: false # use gl4es 1.1.5
-        id: gl4es-cache
-        uses: actions/cache@main
-        with:
-          path: gl4es/libs
-          key: gl4es-holy-ios-shared-2-${{ steps.gl4es-sha.outputs.sha }}
-
-      - name: Get gl4es
-        if: false && steps.gl4es-cache.outputs.cache-hit != 'true'
-        uses: actions/checkout@main
-        with:
-          repository: 'PojavLauncherTeam/gl4es-114-extra'
-          path: 'gl4es'
-
-      - name: Build gl4es
-        if: false && steps.gl4es-cache.outputs.cache-hit != 'true'
-        continue-on-error: true
+      - name: Install JDK 8
         run: |
-          cd gl4es
-          git config user.email "github-actions@users.noreply.github.com"
-          git config user.name "github-actions"
-          export PATH=/opt/procursus/bin:$PATH
+          brew install --cask temurin@8
+          java -version
 
-          wget https://github.com/leetal/ios-cmake/raw/master/ios.toolchain.cmake
-
-          cmake -B build -DCMAKE_TOOLCHAIN_FILE=ios.toolchain.cmake -DDEFAULT_ES=2 \
-            -DNOX11=ON -DNOEGL=OFF -DSTATICLIB=OFF -DPLATFORM=OS64 \
-            -DCMAKE_C_FLAGS=-Wno-error=implicit-function-declaration
-
-          cmake --build build --config RelWithDebInfo --target GL
-
-          cp -R lib/libGL.dylib ../Natives/resources/Frameworks/libgl4es_114.dylib
-
-      - name: Push gl4es
-        if: false && github.event != 'pull_request' && github.ref_name == 'main' && steps.gl4es-cache.outputs.cache-hit != 'true'
-        continue-on-error: true
-        run: |
-          git add Natives/resources/Frameworks/libgl4es_114.dylib
-          git commit -am "CI: Update gl4es"
-          git push
+      - name: Install ldid
+        run: brew install ldid
 
       - name: Build for ${{ matrix.platform_name }}
-        shell: bash
         run: |
-          export PATH=/opt/homebrew/bin:$PATH
-          export SLIMMED=1
-
-          if [ "${{ matrix.platform_name }}" == "ios" ]; then
-            # Build ipa and tipa for iOS
-            gmake -j"$(sysctl -n hw.ncpu)" dsym package PLATFORM=${{ matrix.platform }}
-            gmake -j"$(sysctl -n hw.ncpu)" dsym package PLATFORM=${{ matrix.platform }} TROLLSTORE_JIT_ENT=1
-
-          elif [ "${{ matrix.platform_name }}" == "tvos" ]; then
-            # Build tipa only for tvOS
-            gmake -j"$(sysctl -n hw.ncpu)" dsym package PLATFORM=${{ matrix.platform }} TROLLSTORE_JIT_ENT=1
-
-          else
-            # Build ipa only for everything else
-            gmake -j"$(sysctl -n hw.ncpu)" dsym package PLATFORM=${{ matrix.platform }}
-          fi
+          export PATH=/usr/sbin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
+          sysctl -n hw.ncpu
+          gmake -j"$(sysctl -n hw.ncpu)" dsym package PLATFORM=${{ matrix.platform }}
 
       - name: Upload regular ipa
         uses: actions/upload-artifact@main
         with:
           name: org.angelauramc.amethyst-${{ matrix.platform_name }}.ipa
           path: artifacts/org.angelauramc.amethyst-*-${{ matrix.platform_name }}.ipa
-
-      - name: Upload regular tipa
-        uses: actions/upload-artifact@main
-        with:
-          name: org.angelauramc.amethyst-${{ matrix.platform_name }}-trollstore.tipa
-          path: artifacts/org.angelauramc.amethyst-*-${{ matrix.platform_name }}-trollstore.tipa
-
-      - name: Upload slimmed ipa
-        uses: actions/upload-artifact@main
-        with:
-          name: org.angelauramc.amethyst.slimmed-${{ matrix.platform_name }}.ipa
-          path: artifacts/org.angelauramc.amethyst.slimmed-*-${{ matrix.platform_name }}.ipa
-
-      - name: Upload slimmed tipa
-        uses: actions/upload-artifact@main
-        with:
-          name: org.angelauramc.amethyst.slimmed-${{ matrix.platform_name }}-trollstore.tipa
-          path: artifacts/org.angelauramc.amethyst.slimmed-*-${{ matrix.platform_name }}-trollstore.tipa
-
-      - name: Upload PojavLauncher.dSYM
-        uses: actions/upload-artifact@main
-        if: matrix.platform_name == 'ios'
-        with:
-          name: AngelAuraAmethyst.dSYM
-          path: artifacts/AngelAuraAmethyst.dSYM
