@@ -153,9 +153,7 @@ public final class Tools {
 
     private static String[] splitAndFilterEmpty(String argStr, MinecraftAccount profile) {
         List<String> strList = new ArrayList<String>();
-        if(profile.username.startsWith("Demo.")) {
-            strList.add("--demo");
-        }
+        if(profile.username.startsWith("Demo.")) { }
         for (String arg : argStr.split(" ")) {
             if (!arg.isEmpty()) {
                 strList.add(arg);
