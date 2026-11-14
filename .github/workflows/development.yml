@@ -1,13 +1,7 @@
+
 name: Development build
 
 on:
-  pull_request:
-    branches-ignore:
-      - 'l10n_main'
-    types: [opened, reopened]
-  push:
-    branches-ignore:
-      - 'l10n_main'
   workflow_dispatch:
 
 jobs:
@@ -18,8 +12,9 @@ jobs:
         include:
           - platform: 2
             platform_name: ios
-    
-    runs-on: J316sAP
+
+    runs-on: macos-26
+
     steps:
       - name: Remove work folders
         run: |
@@ -29,99 +24,200 @@ jobs:
           rm -rf ./.??* || true
           echo "after"
           ls -lah ./
-          
+
       - name: Checkout repository
         uses: actions/checkout@main
 
       - name: Checkout repository submodules
-        run: git submodule update --init --recursive
-
-      - name: Get gl4es latest commit hash
-        id: gl4es-sha
-        run: echo "::set-output name=sha::$(echo $(git ls-remote https://github.com/PojavLauncherTeam/gl4es-114-extra refs/heads/master | grep -io '^\S*'))"
         shell: bash
-
-      - name: Cache gl4es
-        uses: actions/cache@main
-        if: false # use gl4es 1.1.5
-        id: gl4es-cache
-        with:
-          path: gl4es/libs
-          key: gl4es-holy-ios-shared-2-${{ steps.gl4es-sha.outputs.sha }}
-
-      - name: Get gl4es
-        if: false && steps.gl4es-cache.outputs.cache-hit != 'true'
-        uses: actions/checkout@main
-        with:
-          repository: 'PojavLauncherTeam/gl4es-114-extra'
-          path: 'gl4es'
-
-      - name: Build gl4es
-        if: false && steps.gl4es-cache.outputs.cache-hit != 'true'
-        continue-on-error: true
         run: |
-          cd gl4es
-          git config user.email "github-actions@users.noreply.github.com"
-          git config user.name "github-actions"
-          export PATH=/opt/procursus/bin:$PATH
-          wget https://github.com/leetal/ios-cmake/raw/master/ios.toolchain.cmake
-          cmake -B build -DCMAKE_TOOLCHAIN_FILE=ios.toolchain.cmake -DDEFAULT_ES=2 \
-            -DNOX11=ON -DNOEGL=OFF -DSTATICLIB=OFF -DPLATFORM=OS64 \
-            -DCMAKE_C_FLAGS=-Wno-error=implicit-function-declaration
-          cmake --build build --config RelWithDebInfo --target GL
-          cp -R lib/libGL.dylib ../Natives/resources/Frameworks/libgl4es_114.dylib
-          
-      - name: Push gl4es
-        if: false && github.event != 'pull_request' && github.ref_name == 'main' && steps.gl4es-cache.outputs.cache-hit != 'true'
-        continue-on-error: true
+          set -euo pipefail
+
+          # Return success only if the exact requested commit exists
+          # in the source repository.
+          source_has_commit() {
+            local url="$1"
+            local sha="$2"
+            local probe_dir
+
+            probe_dir="$(mktemp -d)"
+
+            if GIT_TERMINAL_PROMPT=0 git \
+              -c http.https://github.com/.extraheader= \
+              clone --quiet --bare "$url" "$probe_dir/repo" \
+              >/dev/null 2>&1 \
+              && git --git-dir="$probe_dir/repo" \
+                cat-file -e "${sha}^{commit}" 2>/dev/null; then
+              rm -rf "$probe_dir"
+              return 0
+            fi
+
+            rm -rf "$probe_dir"
+            return 1
+          }
+
+          # Look up the actual submodule name from .gitmodules.
+          submodule_name_for_path() {
+            git config -f .gitmodules --get-regexp \
+              '^submodule\..*\.path$' |
+            awk -v target="$1" '
+              $2 == target {
+                name = $1
+                sub(/^submodule\./, "", name)
+                sub(/\.path$/, "", name)
+                print name
+                exit
+              }
+            '
+          }
+
+          prepare_submodule() {
+            local path="$1"
+            local original="$2"
+            local fallback="$3"
+            local branch="$4"
+            local sha
+            local module_name
+            local selected
+
+            sha="$(git ls-tree HEAD -- "$path" |
+              awk '$1 == "160000" { print $3 }')"
+
+            if [[ -z "$sha" ]]; then
+              echo "::error::Could not find pinned commit for $path"
+              return 1
+            fi
+
+            module_name="$(submodule_name_for_path "$path")"
+
+            if [[ -z "$module_name" ]]; then
+              echo "::error::Could not find submodule name for $path"
+              return 1
+            fi
+
+            # 1. Prefer the original source if it contains the pinned commit.
+            if source_has_commit "$original" "$sha"; then
+              selected="$original"
+
+              echo "::notice::Using original source for $path ($sha)"
+
+              git config --local --replace-all \
+                "submodule.${module_name}.url" "$selected"
+
+              git -c http.https://github.com/.extraheader= \
+                submodule update --init --recursive -- "$path"
+
+              return 0
+            fi
+
+            # 2. Otherwise, use the mirror if it contains the pinned commit.
+            if source_has_commit "$fallback" "$sha"; then
+              selected="$fallback"
+
+              echo "::notice::Using fallback with pinned commit for $path ($sha)"
+
+              git config --local --replace-all \
+                "submodule.${module_name}.url" "$selected"
+
+              git -c http.https://github.com/.extraheader= \
+                submodule update --init --recursive -- "$path"
+
+              return 0
+            fi
+
+            # 3. Neither source has the pinned commit.
+            # Use the fallback branch tip only if that branch exists.
+            if GIT_TERMINAL_PROMPT=0 git \
+              -c http.https://github.com/.extraheader= \
+              ls-remote --exit-code --heads "$fallback" \
+              "refs/heads/$branch" >/dev/null 2>&1; then
+
+              echo "::warning::Pinned commit $sha is unavailable for $path"
+              echo "::warning::Using fallback branch $branch from $fallback"
+
+              # Remove any partially initialized submodule worktree.
+              git submodule deinit -f -- "$path" \
+                >/dev/null 2>&1 || true
+
+              rm -rf "$path"
+              mkdir -p "$(dirname "$path")"
+
+              # This fallback intentionally checks out the branch tip,
+              # not the original pinned commit.
+              GIT_TERMINAL_PROMPT=0 git \
+                -c http.https://github.com/.extraheader= \
+                clone --quiet --depth 1 --single-branch \
+                --branch "$branch" "$fallback" "$path"
+
+              echo "::notice::Actual fallback commit for $path:"
+              git -C "$path" log -1 --format='%H %s'
+
+              return 0
+            fi
+
+            echo "::error::No usable source found for $path"
+            echo "::error::Original pinned commit: $sha"
+            echo "::error::Fallback branch: $branch"
+            return 1
+          }
+
+          # Keep AFNetworking and MobileGlues on their original URLs.
+          git -c http.https://github.com/.extraheader= \
+            submodule update --init --recursive -- \
+            Natives/external/AFNetworking \
+            Natives/external/MobileGlues
+
+          # DBNumberedSlider:
+          # original repository first, then the archived public mirror.
+          prepare_submodule \
+            "Natives/external/DBNumberedSlider" \
+            "https://github.com/khanhduytran0/DBNumberedSlider.git" \
+            "https://github.com/immago/DBNumberedSlider.git" \
+            "master"
+
+          # fishhook:
+          # preserve jev/main whenever its pinned commit is available.
+          prepare_submodule \
+            "Natives/external/fishhook" \
+            "https://github.com/khanhduytran0/fishhook.git" \
+            "https://github.com/jevinskie/fishhook.git" \
+            "jev/main"
+
+      # macos-26 supplies the runner's default Xcode installation.
+      # To pin a particular installed Xcode version, uncomment and
+      # adjust this step to match the runner's available application.
+      #
+      # - name: Select Xcode
+      #   run: sudo xcode-select -s /Applications/Xcode_26.4.1.app
+
+      - name: Install dpkg
         run: |
-          git add Natives/resources/Frameworks/libgl4es_114.dylib
-          git commit -am "CI: Update gl4es"
-          git push
+          brew install dpkg fakeroot || true
+
+      - name: Install GNU Make (gmake)
+        run: brew install make
+
+      - name: Install JDK 8
+        run: |
+          brew install --cask temurin@8
+          java -version
+
+      - name: Install ldid
+        run: brew install ldid
 
       - name: Build for ${{ matrix.platform_name }}
+        shell: bash
         run: |
-          export PATH=/opt/homebrew/bin:$PATH
-          export SLIMMED=1
-          if [ "${{ matrix.platform_name }}" == "ios" ]; then
-            # Build ipa and tipa for iOS
-            gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=${{ matrix.platform }}
-            gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=${{ matrix.platform }} TROLLSTORE_JIT_ENT=1
-          elif [ "${{ matrix.platform_name }}" == "tvos" ]; then
-            # Build tipa only for tvOS
-            gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=${{ matrix.platform }} TROLLSTORE_JIT_ENT=1
-          else
-            # Build ipa only for everything else
-            gmake -j$(sysctl -n hw.ncpu) dsym package PLATFORM=${{ matrix.platform }}
-          fi
+          set -euo pipefail
+          export PATH=/usr/sbin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
+
+          sysctl -n hw.ncpu
+
+          gmake -j"$(sysctl -n hw.ncpu)" \
+            dsym package PLATFORM=${{ matrix.platform }}
 
       - name: Upload regular ipa
         uses: actions/upload-artifact@main
         with:
           name: org.angelauramc.amethyst-${{ matrix.platform_name }}.ipa
           path: artifacts/org.angelauramc.amethyst-*-${{ matrix.platform_name }}.ipa
-
-      - name: Upload regular tipa
-        uses: actions/upload-artifact@main
-        with:
-          name: org.angelauramc.amethyst-${{ matrix.platform_name }}-trollstore.tipa
-          path: artifacts/org.angelauramc.amethyst-*-${{ matrix.platform_name }}-trollstore.tipa
-
-      - name: Upload slimmed ipa
-        uses: actions/upload-artifact@main
-        with:
-          name: org.angelauramc.amethyst.slimmed-${{ matrix.platform_name }}.ipa
-          path: artifacts/org.angelauramc.amethyst.slimmed-*-${{ matrix.platform_name }}.ipa
-
-      - name: Upload slimmed tipa
-        uses: actions/upload-artifact@main
-        with:
-          name: org.angelauramc.amethyst.slimmed-${{ matrix.platform_name }}-trollstore.tipa
-          path: artifacts/org.angelauramc.amethyst.slimmed-*-${{ matrix.platform_name }}-trollstore.tipa
-
-      - name: Upload PojavLauncher.dSYM
-        uses: actions/upload-artifact@main
-        if: matrix.platform_name == 'ios'
-        with:
-          name: AngelAuraAmethyst.dSYM
-          path: artifacts/AngelAuraAmethyst.dSYM
