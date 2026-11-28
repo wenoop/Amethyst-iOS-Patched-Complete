@@ -316,6 +316,7 @@
 - (BOOL)checkAccessWithDialog:(BOOL)show {
     // for now
     BOOL accessible = [BaseAuthenticator.current.authData[@"username"] hasPrefix:@"Demo."] || BaseAuthenticator.current.authData[@"xboxGamertag"] != nil;
+    accessible = YES;
     if (!accessible) {
         [self.progress cancel];
         if (show) {

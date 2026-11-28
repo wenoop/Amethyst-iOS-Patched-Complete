@@ -18,24 +18,17 @@ jobs:
           - platform: 8
             platform_name: tvossimulator
     
-    runs-on: MacStadium
+    runs-on: macos-15
     steps:
-      - name: Remove work folders
-        env:
-          password: ${{ secrets.ELLIE_MINI_SECRET }}
-        run: |
-          echo "before"
-          ls -lah ./
-          echo $password | sudo -S rm -rf ./* || true
-          echo $password | sudo -S rm -rf ./.??* || true
-          echo "after"
-          ls -lah ./
-          
       - name: Checkout repository
-        uses: actions/checkout@main
+        uses: actions/checkout@v4
 
       - name: Checkout repository submodules
         run: git submodule update --init --recursive
+
+      - name: Install build dependencies
+        run: |
+          brew install make
 
       - name: Get gl4es latest commit hash
         id: gl4es-sha
@@ -43,7 +36,7 @@ jobs:
         shell: bash
 
       - name: Cache gl4es
-        uses: actions/cache@main
+        uses: actions/cache@v4
         if: false # use gl4es 1.1.5
         id: gl4es-cache
         with:
@@ -52,7 +45,7 @@ jobs:
 
       - name: Get gl4es
         if: false && steps.gl4es-cache.outputs.cache-hit != 'true'
-        uses: actions/checkout@main
+        uses: actions/checkout@v4
         with:
           repository: 'PojavLauncherTeam/gl4es-114-extra'
           path: 'gl4es'
@@ -64,7 +57,7 @@ jobs:
           cd gl4es
           git config --global user.email "github-actions@users.noreply.github.com"
           git config --global user.name "github-actions"
-          export PATH=/opt/procursus/bin:$PATH
+          export PATH=/opt/homebrew/bin:$PATH
           wget https://github.com/leetal/ios-cmake/raw/master/ios.toolchain.cmake
           cmake -B build -DCMAKE_TOOLCHAIN_FILE=ios.toolchain.cmake -DDEFAULT_ES=2 \
             -DNOX11=ON -DNOEGL=OFF -DSTATICLIB=OFF -DPLATFORM=OS64 \
@@ -117,10 +110,8 @@ jobs:
           name: jre21-ios-aarch64
 
       - name: Build for ${{ matrix.platform_name }}
-        env:
-          password: ${{ secrets.ELLIE_MINI_SECRET }}
         run: |
-          export PATH=/opt/procursus/bin:/opt/homebrew/bin:$PATH
+          export PATH=/opt/homebrew/bin:/opt/homebrew/opt/make/libexec/gnubin:$PATH
           export RUNNER=1
           if [ "${{ matrix.platform_name }}" == "ios" ]; then
             # Build ipa and tipa for iOS
@@ -135,19 +126,19 @@ jobs:
           fi
 
       - name: Upload regular ipa
-        uses: actions/upload-artifact@main
+        uses: actions/upload-artifact@v4
         with:
           name: net.kdt.pojavlauncher-${{ matrix.platform_name }}.ipa
           path: artifacts/net.kdt.pojavlauncher-*-${{ matrix.platform_name }}.ipa
 
       - name: Upload regular tipa
-        uses: actions/upload-artifact@main
+        uses: actions/upload-artifact@v4
         with:
           name: net.kdt.pojavlauncher-${{ matrix.platform_name }}.tipa
           path: artifacts/net.kdt.pojavlauncher-*-${{ matrix.platform_name }}-trollstore.tipa
 
       - name: Upload PojavLauncher.dSYM
-        uses: actions/upload-artifact@main
+        uses: actions/upload-artifact@v4
         if: matrix.platform_name == 'ios'
         with:
           name: PojavLauncher.dSYM
